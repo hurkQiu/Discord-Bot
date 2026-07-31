@@ -11,8 +11,9 @@ import (
 type Config struct {
 	BotToken         string // Discord Bot Token
 	CommandPrefix    string // 文字指令前綴，例如 "!"
-	TextChannelName  string // 允許下指令的文字頻道名稱
+	TextChannelName  string // 允許下音樂指令的文字頻道名稱
 	VoiceChannelName string // 機器人加入播放音樂的語音頻道名稱
+	GameChannelName  string // 允許下小遊戲指令（數獨、踩地雷、熄燈、數織、猜成語）的文字頻道名稱
 	YtDlpPath        string // yt-dlp 執行檔路徑或名稱
 }
 
@@ -31,6 +32,7 @@ func LoadConfig() (*Config, error) {
 		CommandPrefix:    envOrDefault("COMMAND_PREFIX", "!"),
 		TextChannelName:  envOrDefault("TEXT_CHANNEL_NAME", "music"),
 		VoiceChannelName: envOrDefault("VOICE_CHANNEL_NAME", "music"),
+		GameChannelName:  envOrDefault("GAME_CHANNEL_NAME", "games"),
 		YtDlpPath:        envOrDefault("YTDLP_PATH", "yt-dlp"),
 	}
 

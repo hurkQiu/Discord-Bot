@@ -8,6 +8,7 @@ import (
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/cache"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/disgo/gateway"
@@ -15,18 +16,51 @@ import (
 	"github.com/disgoorg/godave/golibdave"
 )
 
+// musicCommands 是只能在音樂文字頻道（TextChannelName）使用的指令集合。
+var musicCommands = map[string]bool{
+	"play": true, "p": true,
+	"skip": true, "s": true,
+	"stop": true, "leave": true,
+	"queue": true, "q": true, "list": true,
+	"pause": true, "resume": true,
+	"nowplaying": true, "np": true,
+	"radio": true,
+}
+
+// gameCommands 是只能在小遊戲文字頻道（GameChannelName）使用的指令集合。
+var gameCommands = map[string]bool{
+	"sudoku":      true,
+	"mine":        true,
+	"minesweeper": true,
+	"lights":      true,
+	"nonogram":    true,
+	"nono":        true,
+	"idiom":       true,
+	"chengyu":     true,
+}
+
 // Bot 封裝 disgo client 與音樂播放邏輯。
 type Bot struct {
-	client  *bot.Client
-	cfg     *Config
-	manager *Manager
+	client   *bot.Client
+	cfg      *Config
+	manager  *Manager
+	sudoku   *SudokuManager
+	mines    *GameManager[MinesweeperGame]
+	lights   *GameManager[LightsOutGame]
+	nonogram *GameManager[NonogramGame]
+	idiom    *GameManager[IdiomGame]
 }
 
 // NewBot 建立 disgo client 並註冊事件處理，同時啟用 DAVE（E2EE）語音加密。
 func NewBot(cfg *Config) (*Bot, error) {
 	b := &Bot{
-		cfg:     cfg,
-		manager: NewManager(),
+		cfg:      cfg,
+		manager:  NewManager(),
+		sudoku:   NewSudokuManager(),
+		mines:    NewGameManager[MinesweeperGame](),
+		lights:   NewGameManager[LightsOutGame](),
+		nonogram: NewGameManager[NonogramGame](),
+		idiom:    NewGameManager[IdiomGame](),
 	}
 
 	client, err := disgo.New(cfg.BotToken,
@@ -37,6 +71,10 @@ func NewBot(cfg *Config) (*Bot, error) {
 				gateway.IntentMessageContent,
 				gateway.IntentGuildVoiceStates,
 			),
+		),
+		// 啟用 Guild/Channel/Role 快取，供 !clear 指令計算成員在頻道內的實際權限（含伺服器擁有者、身分組、頻道覆寫）之用。
+		bot.WithCacheConfigOpts(
+			cache.WithCaches(cache.FlagGuilds, cache.FlagChannels, cache.FlagRoles),
 		),
 		bot.WithEventListenerFunc(b.onReady),
 		bot.WithEventListenerFunc(b.onMessageCreate),
@@ -80,7 +118,13 @@ func (b *Bot) onMessageCreate(e *events.MessageCreate) {
 	}
 
 	channel, err := b.client.Rest.GetChannel(e.ChannelID)
-	if err != nil || channel.Name() != b.cfg.TextChannelName {
+	if err != nil {
+		return
+	}
+	channelName := channel.Name()
+	isMusicChannel := channelName == b.cfg.TextChannelName
+	isGameChannel := channelName == b.cfg.GameChannelName
+	if !isMusicChannel && !isGameChannel {
 		return
 	}
 
@@ -94,6 +138,13 @@ func (b *Bot) onMessageCreate(e *events.MessageCreate) {
 	fields := strings.Fields(body)
 	cmd := strings.ToLower(fields[0])
 	args := strings.TrimSpace(strings.TrimPrefix(body, fields[0]))
+
+	if musicCommands[cmd] && !isMusicChannel {
+		return
+	}
+	if gameCommands[cmd] && !isGameChannel {
+		return
+	}
 
 	switch cmd {
 	case "play", "p":
@@ -112,6 +163,18 @@ func (b *Bot) onMessageCreate(e *events.MessageCreate) {
 		b.cmdNowPlaying(e)
 	case "radio":
 		go b.cmdRadio(e, args)
+	case "sudoku":
+		go b.cmdSudoku(e, args)
+	case "mine", "minesweeper":
+		go b.cmdMinesweeper(e, args)
+	case "lights":
+		go b.cmdLightsOut(e, args)
+	case "nonogram", "nono":
+		go b.cmdNonogram(e, args)
+	case "idiom", "chengyu":
+		go b.cmdIdiom(e, args)
+	case "clear", "clean", "purge":
+		go b.cmdClear(e, args)
 	case "help":
 		b.cmdHelp(e)
 	}
@@ -220,21 +283,51 @@ func (b *Bot) cmdQueue(e *events.MessageCreate) {
 	b.reply(e, sb.String())
 }
 
+// helpTemplate 是 !help 的內容樣板，用 {p} 代表指令前綴。用取代字串而非 fmt.Sprintf 的
+// %s 位置參數，是為了避免每次新增一行指令說明就要重新數對 %s 與參數個數。
+const helpTemplate = `**音樂機器人指令**
+` + "`{p}play <歌曲名稱或網址>`" + ` - 搜尋並播放 / 加入佇列
+` + "`{p}skip`" + ` - 跳過目前歌曲
+` + "`{p}pause`" + ` - 暫停播放
+` + "`{p}resume`" + ` - 繼續播放
+` + "`{p}stop`" + ` - 停止播放並離開語音頻道（含電台模式）
+` + "`{p}queue`" + ` - 顯示播放佇列
+` + "`{p}nowplaying`" + ` - 顯示目前播放進度
+` + "`{p}radio artist <歌手名稱>`" + ` - 啟動該歌手的電台，持續隨機播放並自動接歌
+` + "`{p}radio lang <日文|英文|韓文|中文>`" + ` - 啟動該語言的熱門歌曲電台
+
+**數獨**
+` + "`{p}sudoku new [easy|medium|hard]`" + ` - 開始新的數獨（預設 medium）
+` + "`{p}sudoku <列> <欄> <數字>`" + ` - 填入數字，例如 ` + "`{p}sudoku 3 5 7`" + `，數字用 0 清除該格
+` + "`{p}sudoku show`" + ` / ` + "`{p}sudoku stop`" + ` - 重新顯示 / 結束目前的數獨
+
+**踩地雷**
+` + "`{p}mine new [easy|medium|hard]`" + ` - 開始新的踩地雷（預設 medium）
+` + "`{p}mine <列> <欄>`" + ` - 開啟一格，例如 ` + "`{p}mine 3 5`" + `
+` + "`{p}mine flag <列> <欄>`" + ` - 插旗 / 取消插旗
+` + "`{p}mine show`" + ` / ` + "`{p}mine stop`" + ` - 重新顯示 / 結束目前的踩地雷
+
+**熄燈遊戲**
+` + "`{p}lights new`" + ` - 開始新的熄燈遊戲
+` + "`{p}lights <列> <欄>`" + ` - 按下一格燈，例如 ` + "`{p}lights 2 3`" + `，會連帶切換上下左右的燈
+` + "`{p}lights show`" + ` / ` + "`{p}lights stop`" + ` - 重新顯示 / 結束目前的熄燈遊戲
+
+**數織**
+` + "`{p}nonogram new`" + ` - 開始新的數織
+` + "`{p}nonogram <列> <欄>`" + ` - 切換一格的填色狀態，例如 ` + "`{p}nonogram 3 5`" + `
+` + "`{p}nonogram show`" + ` / ` + "`{p}nonogram stop`" + ` - 重新顯示 / 結束目前的數織
+
+**猜成語**
+` + "`{p}idiom new`" + ` - 開始新的猜成語（六次機會）
+` + "`{p}idiom <四字成語>`" + ` - 送出一次猜測，例如 ` + "`{p}idiom 一帆風順`" + `
+` + "`{p}idiom show`" + ` / ` + "`{p}idiom stop`" + ` - 重新顯示 / 結束目前的猜成語
+
+**頻道管理**
+` + "`{p}clear confirm`" + ` - 清除目前頻道內的全部訊息（需要「管理訊息」權限，無法復原）
+`
+
 func (b *Bot) cmdHelp(e *events.MessageCreate) {
-	prefix := b.cfg.CommandPrefix
-	help := fmt.Sprintf(
-		"**音樂機器人指令**\n"+
-			"`%splay <歌曲名稱或網址>` - 搜尋並播放 / 加入佇列\n"+
-			"`%sskip` - 跳過目前歌曲\n"+
-			"`%spause` - 暫停播放\n"+
-			"`%sresume` - 繼續播放\n"+
-			"`%sstop` - 停止播放並離開語音頻道（含電台模式）\n"+
-			"`%squeue` - 顯示播放佇列\n"+
-			"`%snowplaying` - 顯示目前播放進度\n"+
-			"`%sradio artist <歌手名稱>` - 啟動該歌手的電台，持續隨機播放並自動接歌\n"+
-			"`%sradio lang <日文|英文|韓文|中文>` - 啟動該語言的熱門歌曲電台\n",
-		prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix,
-	)
+	help := strings.ReplaceAll(helpTemplate, "{p}", b.cfg.CommandPrefix)
 	b.reply(e, help)
 }
 
